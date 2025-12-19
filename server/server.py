@@ -6,19 +6,17 @@ using the browser_use library. It provides functionality to interact with a brow
 via an async task queue, allowing for long-running browser tasks to be executed asynchronously
 while providing status updates and results.
 
-The server supports Server-Sent Events (SSE) for web-based interfaces.
+The server exposes a streamable HTTP transport for web-based interfaces and can optionally
+run over stdio.
 """
 
 # Standard library imports
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import sys
-
-# Set up SSE transport
-import threading
-import time
 import traceback
 import uuid
 from datetime import datetime
@@ -27,7 +25,6 @@ from typing import Any, Dict, Optional, Tuple, Union
 # Third-party imports
 import click
 import mcp.types as types
-import uvicorn
 
 # Browser-use library imports
 from browser_use import Agent
@@ -41,10 +38,9 @@ from langchain_openai import ChatOpenAI
 
 # MCP server components
 from mcp.server import Server
-from mcp.server.sse import SseServerTransport
+from mcp.server.http import HttpServerTransport
+from mcp.server.stdio import StdioServerTransport
 from pythonjsonlogger import jsonlogger
-from starlette.applications import Starlette
-from starlette.routing import Mount, Route
 
 # Configure logging
 logger = logging.getLogger()
@@ -56,11 +52,6 @@ formatter = jsonlogger.JsonFormatter(
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
-
-# Ensure uvicorn also logs to stderr in JSON format
-uvicorn_logger = logging.getLogger("uvicorn")
-uvicorn_logger.handlers = []
-uvicorn_logger.addHandler(handler)
 
 # Ensure all other loggers use the same format
 logging.getLogger("browser_use").addHandler(handler)
@@ -728,13 +719,8 @@ def create_mcp_server(
 
 
 @click.command()
-@click.option("--port", default=8000, help="Port to listen on for SSE")
-@click.option(
-    "--proxy-port",
-    default=None,
-    type=int,
-    help="Port for the proxy to listen on. If specified, enables proxy mode.",
-)
+@click.option("--host", default="0.0.0.0", help="Host to bind for HTTP transport")  # nosec
+@click.option("--port", default=8000, help="Port to listen on for HTTP transport")
 @click.option("--chrome-path", default=None, help="Path to Chrome executable")
 @click.option(
     "--window-width",
@@ -756,11 +742,11 @@ def create_mcp_server(
     "--stdio",
     is_flag=True,
     default=False,
-    help="Enable stdio mode. If specified, enables proxy mode.",
+    help="Run only the native stdio transport instead of HTTP streaming.",
 )
 def main(
+    host: str,
     port: int,
-    proxy_port: Optional[int],
     chrome_path: str,
     window_width: int,
     window_height: int,
@@ -771,22 +757,22 @@ def main(
     """
     Run the browser-use MCP server.
 
-    This function initializes the MCP server and runs it with the SSE transport.
+    This function initializes the MCP server and runs it with the stock MCP HTTP transport.
     Each browser task will create its own isolated browser context.
 
     The server can run in two modes:
-    1. Direct SSE mode (default): Just runs the SSE server
-    2. Proxy mode (enabled by --stdio or --proxy-port): Runs both SSE server and mcp-proxy
+    1. HTTP streaming mode (default)
+    2. Stdio mode (enabled by --stdio) for environments that require it
 
     Args:
-        port: Port to listen on for SSE
-        proxy_port: Port for the proxy to listen on. If specified, enables proxy mode.
+        host: Host interface for the HTTP transport
+        port: Port to listen on for HTTP
         chrome_path: Path to Chrome executable
         window_width: Browser window width
         window_height: Browser window height
         locale: Browser locale
         task_expiry_minutes: Minutes after which tasks are considered expired
-        stdio: Enable stdio mode. If specified, enables proxy mode.
+        stdio: Enable stdio mode instead of HTTP.
 
     Returns:
         Exit code (0 for success)
@@ -812,127 +798,66 @@ def main(
         locale=locale,
     )
 
-    sse = SseServerTransport("/messages/")
-
-    # Create the Starlette app for SSE
-    async def handle_sse(request):
-        """Handle SSE connections from clients."""
-        try:
-            async with sse.connect_sse(
-                request.scope, request.receive, request._send
-            ) as streams:
-                await app.run(
-                    streams[0], streams[1], app.create_initialization_options()
-                )
-        except Exception as e:
-            logger.error(f"Error in handle_sse: {str(e)}")
-            raise
-
-    starlette_app = Starlette(
-        debug=True,
-        routes=[
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
-        ],
-    )
-
-    # Add startup event
-    @starlette_app.on_event("startup")
-    async def startup_event():
-        """Initialize the server on startup."""
-        logger.info("Starting MCP server...")
-
-        # Sanity checks for critical configuration
+    # Sanity checks for critical configuration
+    if not stdio:
         if port <= 0 or port > 65535:
             logger.error(f"Invalid port number: {port}")
             raise ValueError(f"Invalid port number: {port}")
+    if window_width <= 0 or window_height <= 0:
+        logger.error(f"Invalid window dimensions: {window_width}x{window_height}")
+        raise ValueError(f"Invalid window dimensions: {window_width}x{window_height}")
 
-        if window_width <= 0 or window_height <= 0:
-            logger.error(f"Invalid window dimensions: {window_width}x{window_height}")
-            raise ValueError(
-                f"Invalid window dimensions: {window_width}x{window_height}"
-            )
+    if task_expiry_minutes <= 0:
+        logger.error(f"Invalid task expiry minutes: {task_expiry_minutes}")
+        raise ValueError(f"Invalid task expiry minutes: {task_expiry_minutes}")
 
-        if task_expiry_minutes <= 0:
-            logger.error(f"Invalid task expiry minutes: {task_expiry_minutes}")
-            raise ValueError(f"Invalid task expiry minutes: {task_expiry_minutes}")
-
-        # Start background task cleanup
-        asyncio.create_task(app.cleanup_old_tasks())
-        logger.info("Task cleanup process scheduled")
-
-    # Function to run uvicorn in a separate thread
-    def run_uvicorn():
-        # Configure uvicorn to use JSON logging
-        log_config = {
-            "version": 1,
-            "disable_existing_loggers": False,
-            "formatters": {
-                "json": {
-                    "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
-                    "fmt": '{"time":"%(asctime)s","level":"%(levelname)s","name":"%(name)s","message":"%(message)s"}',
-                }
-            },
-            "handlers": {
-                "default": {
-                    "formatter": "json",
-                    "class": "logging.StreamHandler",
-                    "stream": "ext://sys.stderr",
-                }
-            },
-            "loggers": {
-                "": {"handlers": ["default"], "level": "INFO"},
-                "uvicorn": {"handlers": ["default"], "level": "INFO"},
-                "uvicorn.error": {"handlers": ["default"], "level": "INFO"},
-                "uvicorn.access": {"handlers": ["default"], "level": "INFO"},
-            },
-        }
-
-        uvicorn.run(
-            starlette_app,
-            host="0.0.0.0",  # nosec
-            port=port,
-            log_config=log_config,
-            log_level="info",
-        )
-
-    # If proxy mode is enabled, run both the SSE server and mcp-proxy
-    if stdio:
-        import subprocess  # nosec
-
-        # Start the SSE server in a separate thread
-        sse_thread = threading.Thread(target=run_uvicorn)
-        sse_thread.daemon = True
-        sse_thread.start()
-
-        # Give the SSE server a moment to start
-        time.sleep(1)
-
-        proxy_cmd = [
-            "mcp-proxy",
-            f"http://localhost:{port}/sse",
-            "--sse-port",
-            str(proxy_port),
-            "--allow-origin",
-            "*",
-        ]
-
-        logger.info(f"Running proxy command: {' '.join(proxy_cmd)}")
-        logger.info(
-            f"SSE server running on port {port}, proxy running on port {proxy_port}"
-        )
-
+    async def run_stdio_transport() -> None:
+        logger.info("Starting native stdio transport")
+        cleanup_task = asyncio.create_task(app.cleanup_old_tasks())
         try:
-            # Using trusted command arguments from CLI parameters
-            with subprocess.Popen(proxy_cmd) as proxy_process:  # nosec
-                proxy_process.wait()
-        except Exception as e:
-            logger.error(f"Error starting mcp-proxy: {str(e)}")
-            logger.error(f"Command was: {' '.join(proxy_cmd)}")
-            return 1
-    else:
-        logger.info(f"Running in direct SSE mode on port {port}")
-        run_uvicorn()
+            transport = StdioServerTransport()
+            async with transport as streams:
+                await app.run(
+                    streams[0], streams[1], app.create_initialization_options()
+                )
+        finally:
+            cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cleanup_task
+
+    async def run_http_transport() -> None:
+        logger.info(f"Running MCP server over HTTP on {host}:{port}")
+        cleanup_task = asyncio.create_task(app.cleanup_old_tasks())
+        transport = HttpServerTransport(host=host, port=port)
+        try:
+            async with transport:
+                serve_method = getattr(transport, "serve", None)
+                if callable(serve_method):
+                    await serve_method(
+                        app, initialization_options=app.create_initialization_options()
+                    )
+                    return
+                run_method = getattr(transport, "run", None)
+                if not callable(run_method):
+                    raise RuntimeError(
+                        "HttpServerTransport must expose a serve(...) or run(...) coroutine"
+                    )
+                await run_method(
+                    app, initialization_options=app.create_initialization_options()
+                )
+        finally:
+            cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cleanup_task
+
+    try:
+        if stdio:
+            asyncio.run(run_stdio_transport())
+        else:
+            asyncio.run(run_http_transport())
+    except Exception as e:
+        logger.error(f"Error running transport: {str(e)}")
+        return 1
 
     return 0
 
