@@ -41,13 +41,8 @@ def cli():
 
 @cli.command()
 @click.argument("subcommand")
-@click.option("--port", default=8000, help="Port to listen on for SSE")
-@click.option(
-    "--proxy-port",
-    default=None,
-    type=int,
-    help="Port for the proxy to listen on (when using stdio mode)",
-)
+@click.option("--host", default="0.0.0.0", help="Host to bind for HTTP transport")  # nosec
+@click.option("--port", default=8000, help="Port to listen on for HTTP transport")
 @click.option("--chrome-path", default=None, help="Path to Chrome executable")
 @click.option("--window-width", default=1280, help="Browser window width")
 @click.option("--window-height", default=1100, help="Browser window height")
@@ -57,13 +52,11 @@ def cli():
     default=60,
     help="Minutes after which tasks are considered expired",
 )
-@click.option(
-    "--stdio", is_flag=True, default=False, help="Enable stdio mode with mcp-proxy"
-)
+@click.option("--stdio", is_flag=True, default=False, help="Run stdio transport only")
 def run(
     subcommand,
+    host,
     port,
-    proxy_port,
     chrome_path,
     window_width,
     window_height,
@@ -86,15 +79,14 @@ def run(
         # Build a new argument list for the server command
         new_argv = [
             "server",  # Program name
+            "--host",
+            str(host),
             "--port",
             str(port),
         ]
 
         if chrome_path:
             new_argv.extend(["--chrome-path", chrome_path])
-
-        if proxy_port is not None:
-            new_argv.extend(["--proxy-port", str(proxy_port)])
 
         new_argv.extend(["--window-width", str(window_width)])
         new_argv.extend(["--window-height", str(window_height)])

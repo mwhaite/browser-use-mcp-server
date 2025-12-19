@@ -19,12 +19,10 @@
 
 - [uv](https://github.com/astral-sh/uv) - Fast Python package manager
 - [Playwright](https://playwright.dev/) - Browser automation
-- [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy) - Required for stdio mode
 
 ```bash
 # Install prerequisites
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv tool install mcp-proxy
 uv tool update-shell
 ```
 
@@ -49,11 +47,11 @@ uv run playwright install --with-deps --no-shell chromium
 
 ## Usage
 
-### SSE Mode
+### HTTP Mode (default)
 
 ```bash
-# Run directly from source
-uv run server --port 8000
+# Run directly from source (HTTP streaming)
+uv run server --host 0.0.0.0 --port 8000
 ```
 
 ### stdio Mode
@@ -64,19 +62,19 @@ uv build
 uv tool uninstall browser-use-mcp-server 2>/dev/null || true
 uv tool install dist/browser_use_mcp_server-*.whl
 
-# 2. Run with stdio transport
-browser-use-mcp-server run server --port 8000 --stdio --proxy-port 9000
+# 2. Run with stdio transport only
+browser-use-mcp-server run server --port 8000 --stdio
 ```
 
 ## Client Configuration
 
-### SSE Mode Client Configuration
+### HTTP Mode Client Configuration
 
 ```json
 {
   "mcpServers": {
     "browser-use-mcp-server": {
-      "url": "http://localhost:8000/sse"
+      "url": "http://localhost:8000/"
     }
   }
 }
@@ -94,9 +92,7 @@ browser-use-mcp-server run server --port 8000 --stdio --proxy-port 9000
         "server",
         "--port",
         "8000",
-        "--stdio",
-        "--proxy-port",
-        "9000"
+        "--stdio"
       ],
       "env": {
         "OPENAI_API_KEY": "your-api-key"
@@ -118,7 +114,7 @@ browser-use-mcp-server run server --port 8000 --stdio --proxy-port 9000
 ## Features
 
 - [x] **Browser Automation**: Control browsers through AI agents
-- [x] **Dual Transport**: Support for both SSE and stdio protocols
+- [x] **Transport Options**: Support for HTTP streaming or stdio protocols
 - [x] **VNC Streaming**: Watch browser automation in real-time
 - [x] **Async Tasks**: Execute browser operations asynchronously
 
@@ -147,7 +143,7 @@ To develop and test the package locally:
    export OPENAI_API_KEY=your-api-key-here
 
    # Or provide it inline for a one-time run
-   OPENAI_API_KEY=your-api-key-here browser-use-mcp-server run server --port 8000 --stdio --proxy-port 9000
+   OPENAI_API_KEY=your-api-key-here browser-use-mcp-server run server --port 8000 --stdio
    ```
 
 4. After making changes, rebuild and reinstall:
